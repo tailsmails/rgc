@@ -10,6 +10,8 @@ RGC is a lightweight, concurrent resource garbage collector for V. It actively m
 - **Bootstrapping Protection:** Implements a recursion-safe resolver with raw assembly `syscall()` fallbacks to prevent linker lock-ups during startup symbol resolution.
 - **Non-Blocking Callbacks:** Implements lock-release patterns to execute user-defined cleanup callbacks outside the internal mutex regions, eliminating thread deadlocks.
 
+---
+
 ## Installation
 
 Install RGC directly from GitHub using the V package manager:
@@ -17,6 +19,8 @@ Install RGC directly from GitHub using the V package manager:
 ```bash
 v install --git https://github.com/tailsmails/rgc
 ```
+
+---
 
 ## Usage
 
@@ -61,6 +65,8 @@ If you prefer to include RGC directly within your project without installing it 
         └── hooks.c
 ```
 
+---
+
 ## Compilation
 
 To compile your application, enable global variables during compilation:
@@ -70,8 +76,15 @@ v -enable-globals main.v
 ./main
 ```
 
+---
+
 ## Technical Implementation Details
 
 - **Concurrency Safeness:** The scavenger loop evaluates idle intervals concurrently. When a custom resource times out, VGC copies the object state, purges the reference from the map, unlocks the mutex, and executes the user callback. This prevents self-deadlocks if the callback invokes tracked I/O operations (such as `println` or file writes).
 - **Symbol Interception:** Hooks are statically linked into the main binary. A static C constructor dynamically queries the platform's `libc.so` (using absolute paths `/system/lib64/libc.so` or `/system/lib/libc.so` if `RTLD_DEFAULT` is restricted) to call `android_fdsan_set_error_level` and set it to `DISABLED` on Android.
 - **Raw System Transitions:** Critical timing evaluations utilize direct C `C.time` pointers instead of high-level runtime abstractions to prevent indirect filesystem/timezone lookups from triggering nested I/O calls.
+
+---
+
+## License
+![License](https://img.shields.io/badge/License-MIT-black.svg)
