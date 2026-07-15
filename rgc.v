@@ -3,7 +3,7 @@ module rgc
 import sync
 
 #flag -I @VMODROOT/c
-#flag @VMODROOT/c/hooks.o
+#flag @VMODROOT/c/hooks.c
 #include "hooks.h"
 #include <pthread.h>
 #include <unistd.h>
@@ -19,6 +19,7 @@ fn C.pthread_detach(thread C.pthread_t) int
 fn C.sleep(seconds u32) u32
 fn C.raw_close(fd int)
 fn C.time(t voidptr) i64
+fn C.is_listening_socket(fd int) int
 
 pub type DisposeFn = fn (voidptr)
 
@@ -30,18 +31,18 @@ mut:
 }
 
 struct CustomResource {
-    id          voidptr
-    tag         string
-    dispose_fn  DisposeFn = unsafe { nil }
+    id         voidptr
+    tag        string
+    dispose_fn DisposeFn = unsafe { nil }
 mut:
     last_active i64
     is_active   bool
 }
 
 __global (
-    fd_table [1024]FDInfo
+    fd_table         [1024]FDInfo
     custom_resources map[string]&CustomResource
-    mtx sync.Mutex
+    mtx              sync.Mutex
 )
 
 fn gc_worker(arg voidptr) voidptr {
@@ -50,25 +51,31 @@ fn gc_worker(arg voidptr) voidptr {
         C.sleep(2)
         now := C.time(unsafe { nil })
         mut expired_custom := []CustomResource{}
+
         mtx.lock()
         for i in 0 .. 1024 {
             if fd_table[i].is_active {
                 if now - fd_table[i].last_active > 5 {
-                    C.raw_close(fd_table[i].fd)
-                    fd_table[i].is_active = false
+                    if C.is_listening_socket(fd_table[i].fd) == 1 {
+                        fd_table[i].last_active = now
+                    } else {
+                        C.raw_close(fd_table[i].fd)
+                        fd_table[i].is_active = false
+                    }
                 }
             }
         }
+
         mut keys_to_delete := []string{}
         for key, res in custom_resources {
             if res.is_active {
                 if now - res.last_active > 5 {
                     expired_custom << CustomResource{
-                        id: res.id
-                        tag: res.tag
-                        dispose_fn: res.dispose_fn
+                        id:          res.id
+                        tag:         res.tag
+                        dispose_fn:  res.dispose_fn
                         last_active: res.last_active
-                        is_active: res.is_active
+                        is_active:   res.is_active
                     }
                     keys_to_delete << key
                 }
@@ -78,6 +85,7 @@ fn gc_worker(arg voidptr) voidptr {
             custom_resources.delete(k)
         }
         mtx.unlock()
+
         for res in expired_custom {
             res.dispose_fn(res.id)
         }
@@ -118,20 +126,24 @@ fn track_close(fd int) {
 
 pub fn track(id voidptr, tag string, dispose DisposeFn) {
     mtx.lock()
-    defer { mtx.unlock() }
+    defer {
+        mtx.unlock()
+    }
     key := '${tag}:${id}'
     custom_resources[key] = &CustomResource{
-        id: id
-        tag: tag
-        dispose_fn: dispose
+        id:          id
+        tag:         tag
+        dispose_fn:  dispose
         last_active: C.time(unsafe { nil })
-        is_active: true
+        is_active:   true
     }
 }
 
 pub fn touch(id voidptr, tag string) {
     mtx.lock()
-    defer { mtx.unlock() }
+    defer {
+        mtx.unlock()
+    }
     key := '${tag}:${id}'
     if key in custom_resources {
         mut res := custom_resources[key] or { return }
@@ -141,7 +153,9 @@ pub fn touch(id voidptr, tag string) {
 
 pub fn release(id voidptr, tag string) {
     mtx.lock()
-    defer { mtx.unlock() }
+    defer {
+        mtx.unlock()
+    }
     key := '${tag}:${id}'
     if key in custom_resources {
         custom_resources.delete(key)
