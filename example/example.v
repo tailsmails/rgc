@@ -2,21 +2,40 @@ import rgc
 import os
 import time
 
-fn mock_unmap(addr voidptr) {
-    println('[RGC] Safe cleanup: unmapping custom resource at ${addr}')
+fn C.write(fd int, buf voidptr, count usize) int
+
+fn free_mmap(addr voidptr) {
+    println('Disposing address: ${addr}')
 }
 
 fn main() {
-    rgc.start()
+    rgc.start(rgc.GCConfig{
+        fd_limit: 1024
+        idle_timeout: 5
+        check_interval: 2
+    })
 
     mut f := os.create('leaked_file.txt') or { panic(err) }
     println('App: File created with FD ${f.fd}')
 
-    mock_mmap_ptr := voidptr(0xdeadbeef)
-    rgc.track(mock_mmap_ptr, 'mmap', mock_unmap)
-    println('App: Registered custom mmap resource at ${mock_mmap_ptr}')
+    mock_ptr := voidptr(0xdeadbeef)
+    rgc.track(mock_ptr, 'mmap', free_mmap)
+    println('App: Registered custom resource at ${mock_ptr}')
 
-    println('App: Going into sleep. RGC will sweep both FD ${f.fd} and mmap in 5 seconds...')
+    rgc.exempt_fd(f.fd)
+    println('App: Exempted FD ${f.fd} from garbage collection')
+
+    time.sleep(6 * time.second)
+
+    rgc.monitor_fd(f.fd)
+    println('App: FD ${f.fd} is now back under active GC monitoring')
+
     time.sleep(10 * time.second)
-    println('App: Terminated.')
+
+    res := C.write(f.fd, 'this should fail'.str, 16)
+    if res < 0 {
+        println('Verified: FD 3 was successfully closed by RGC!')
+    } else {
+        println('Oops! raw write succeeded unexpectedly! Size: ${res}')
+    }
 }

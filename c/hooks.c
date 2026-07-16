@@ -114,7 +114,13 @@ static void resolve_symbols() {
     resolving = 0;
 }
 
-void raw_close(int fd) { syscall(__NR_close, fd); }
+int raw_close(int fd) {
+    resolve_symbols();
+    if (orig_close) {
+        return orig_close(fd);
+    }
+    return syscall(__NR_close, fd);
+}
 
 int open(const char *pathname, int flags, ...) {
     mode_t mode = 0;
