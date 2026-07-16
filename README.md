@@ -112,5 +112,48 @@ v -enable-globals -g main.v
 
 ---
 
+## Core Concepts & Architectural Design
+
+RGC is designed around advanced systems programming paradigms to ensure that low-level resource management is both safe and developer-friendly. Below is an in-depth breakdown of the core concepts and mechanics that govern RGC's runtime behavior.
+
+### 1. Resource Activity & The `touch` Heartbeat
+At the heart of RGC is an inactivity-based garbage collector. When a custom resource is registered, RGC initiates an idle countdown. 
+- To keep an active resource from being garbage collected, the developer must periodically invoke the `touch()` function. 
+- The `touch()` operation acts as a heartbeat, resetting the resource's last-active timestamp to the current system time. This restarts the idle countdown from zero.
+- This is particularly crucial for custom, non-descriptor resources (like memory maps, GPU contexts, or active DB connections) where the operating system does not automatically record read/write activity.
+
+### 2. Explicit Exemption & Monitoring (Whitelisting)
+Certain resources must remain open indefinitely, even if they stay inactive for long periods (e.g., database connection pools, persistent Keep-Alive sockets, or daemon listeners).
+- **Exemption (`exempt` / `exempt_fd`):** This operation flags a specific resource as exempt. During the sweep cycles, the background scavenger worker completely ignores whitelisted resources, ensuring they are never closed due to idle timeout.
+- **Monitoring (`monitor` / `monitor_fd`):** This reverses the exemption. Once called, the resource is placed back into the active garbage collection cycle, and its inactivity tracking resumes from that exact timestamp.
+
+### 3. Automatic OS-Level Interception
+To manage standard OS descriptors without forcing developers to manually call keep-alive heartbeats, RGC integrates low-level interception hooks.
+- It overrides POSIX-compliant system calls (such as `open`, `read`, `write`, and `close`) in the C layer.
+- Every time a file descriptor is accessed by the application, the underlying hook intercepts the call and silently updates the descriptor's last-active timestamp. This ensures transparent, zero-effort garbage collection for standard I/O resources.
+
+### 4. Standard I/O Shielding
+In POSIX-compliant operating systems, file descriptors `0`, `1`, and `2` represent standard input (`stdin`), standard output (`stdout`), and standard error (`stderr`), respectively.
+- If these descriptors were to be closed due to a period of inactivity, the application would lose the ability to print logs to the console or receive user input, resulting in an unresponsive state.
+- During initialization, RGC automatically flags these three system-critical descriptors as perpetually exempt, ensuring the application's basic console and logging infrastructure is never broken.
+
+### 5. Bionic libc & fdsan Compatibility
+Modern Android systems use Bionic libc, which features a utility called `fdsan` (File Descriptor Sanitizer). This sanitizer actively monitors the process to detect improper file descriptor usage, such as double-closes.
+- Because RGC's background scavenger manages and closes file descriptors dynamically, `fdsan` might flag these background closures as anomalous, causing the Android process to terminate abruptly.
+- To guarantee cross-platform compatibility, RGC checks for Android environments during initialization and dynamically adjusts the process-wide `fdsan` error level to prevent runtime validation crashes.
+
+### 6. FD Recycling & Race Condition Prevention
+Operating systems heavily recycle file descriptor IDs. Once a file is closed, its ID is quickly reassigned to the next opened file. This behavior introduces a classic systems-programming race condition:
+- If the scavenger decides to close an idle descriptor (e.g., ID `10`), but another thread opens a new file and receives ID `10` right before the close occurs, the scavenger might accidentally close the newly opened, valid file.
+- RGC prevents this by wrapping state transitions (`is_active = false`) and the actual close operation within a single, highly synchronized mutex block. This atomic check ensures that a descriptor cannot be reassigned or reused while the scavenger is actively processing its closure.
+
+### 7. Lock-Release Isolation & Deadlock Prevention
+A common pitfall in concurrent programming is executing arbitrary user code while holding internal synchronization locks. If a user's custom `dispose_fn` callback attempts to call RGC functions (like registering or releasing a resource) while the global mutex is locked, it will cause a permanent thread deadlock.
+- RGC solves this with a two-phase cleanup pipeline. 
+- In the first phase, it locks the resource table, identifies all expired custom resources, removes them from the active list, and temporarily buffers them.
+- In the second phase, it completely releases the global mutex *before* iterating over the expired buffer to execute the user's custom cleanup callbacks. This design guarantees thread-safety and eliminates the possibility of deadlocks.
+
+---
+
 ## License
 ![License](https://img.shields.io/badge/License-MIT-black.svg)
