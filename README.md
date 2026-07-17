@@ -153,6 +153,54 @@ A common pitfall in concurrent programming is executing arbitrary user code whil
 - In the first phase, it locks the resource table, identifies all expired custom resources, removes them from the active list, and temporarily buffers them.
 - In the second phase, it completely releases the global mutex *before* iterating over the expired buffer to execute the user's custom cleanup callbacks. This design guarantees thread-safety and eliminates the possibility of deadlocks.
 
+### Timeout Management
+
+RGC allows you to maintain control over the lifetimes of your sockets, files, and custom resources. By default, resources are garbage-collected based on a global idle timeout, but you can also configure fine-grained, individual timeouts for specific file descriptors or custom resources.
+
+#### 1. Global Idle Timeout
+During initialization, you can define a global `idle_timeout` (in seconds) via `GCConfig`. If a resource or socket remains inactive (no read operations recorded) for longer than this duration, it is automatically closed or disposed.
+
+```v
+import rgc
+
+fn main() {
+    rgc.start(rgc.GCConfig{
+        idle_timeout: 10 // Global timeout of 10 seconds
+        check_interval: 2
+    })
+}
+```
+
+#### 2. Custom Timeout for File Descriptors (FDs)
+Not all connections have the same lifecycle. For example, a persistent database file or a long-lived keep-alive socket might need to stay open much longer than a transient HTTP connection. You can override the global timeout for individual file descriptors using `set_fd_timeout`:
+
+```v
+mut f := os.create('persistent_log.log') or { panic(err) }
+
+// Keep this file descriptor open for up to 1 hour (3600 seconds) of inactivity
+rgc.set_fd_timeout(f.fd, 3600)
+```
+
+#### 3. Custom Timeout for Custom Resources
+Similarly, custom resources (such as memory pointers, database connection handles, or third-party handles) can be assigned dedicated lease times using `set_timeout`. This overrides the default global timeout for that specific resource:
+
+```v
+mock_ptr := voidptr(0xdeadbeef)
+rgc.track(mock_ptr, 'db_conn', close_db_connection)
+
+// This connection handle will only expire after 120 seconds of inactivity (no `touch` calls)
+rgc.set_timeout(mock_ptr, 'db_conn', 120)
+```
+
+#### Timeout API Reference
+
+| Function | Description |
+|---|---|
+| `rgc.set_fd_timeout(fd int, timeout_sec i64)` | Overrides the global timeout for a specific file descriptor. |
+| `rgc.set_timeout(id voidptr, tag string, timeout_sec i64)` | Overrides the global timeout for a specific registered custom resource. |
+| `rgc.exempt_fd(fd int)` | Completely exempts a file descriptor from being closed, regardless of inactivity. |
+| `rgc.exempt(id voidptr, tag string)` | Completely exempts a custom resource from being disposed, regardless of inactivity. |
+
 ---
 
 ## License
