@@ -16,6 +16,8 @@ fn C.is_listening_socket(fd int) int
 
 pub type DisposeFn = fn (voidptr)
 
+const bucket_count = 16
+
 struct FDInfo {
 mut:
     fd          int
@@ -52,12 +54,17 @@ pub:
     total_disposed   u64
 }
 
+struct FDBucket {
+mut:
+    mtx      sync.Mutex
+    fd_table map[int]&FDInfo
+}
+
 __global (
     initialized      bool
-    fd_table         map[int]&FDInfo
+    fd_buckets       []FDBucket
     custom_resources map[string]&CustomResource
     mtx              sync.Mutex
-    fd_mtx           sync.Mutex
     global_config    GCConfig
     total_closed_fds u64
     total_disposed   u64
@@ -76,30 +83,35 @@ fn gc_worker(config GCConfig) {
 
         mut fds_to_close := []int{}
 
-        fd_mtx.lock()
-        for fd, mut info in fd_table {
-            if info.is_active && !info.is_exempt {
-                current_timeout := if info.timeout > 0 { info.timeout } else { config.idle_timeout }
-                if now - info.last_active > current_timeout {
-                    if C.is_listening_socket(fd) == 1 {
-                        info.last_active = now
-                    } else {
-                        info.is_active = false
-                        fds_to_close << fd
+        for i in 0 .. bucket_count {
+            mut bucket := &fd_buckets[i]
+            bucket.mtx.lock()
+            for fd, mut info in bucket.fd_table {
+                if info.is_active && !info.is_exempt {
+                    current_timeout := if info.timeout > 0 { info.timeout } else { config.idle_timeout }
+                    if now - info.last_active > current_timeout {
+                        if C.is_listening_socket(fd) == 1 {
+                            info.last_active = now
+                        } else {
+                            info.is_active = false
+                            fds_to_close << fd
+                        }
                     }
                 }
             }
+            bucket.mtx.unlock()
         }
-        fd_mtx.unlock()
 
         for fd in fds_to_close {
             rgc_log('FD ${fd} expired! Closing now.')
             close_res := C.raw_close(fd)
             rgc_log('raw_close returned: ${close_res}')
             
-            fd_mtx.lock()
+            bucket_idx := fd % bucket_count
+            mut bucket := &fd_buckets[bucket_idx]
+            bucket.mtx.lock()
             total_closed_fds++
-            fd_mtx.unlock()
+            bucket.mtx.unlock()
         }
 
         mut expired_custom := []CustomResource{}
@@ -146,11 +158,13 @@ fn track_open(fd int) {
         return
     }
     rgc_log('track_open called for FD ${fd}')
-    fd_mtx.lock()
+    bucket_idx := fd % bucket_count
+    mut bucket := &fd_buckets[bucket_idx]
+    bucket.mtx.lock()
     defer {
-        fd_mtx.unlock()
+        bucket.mtx.unlock()
     }
-    fd_table[fd] = &FDInfo{
+    bucket.fd_table[fd] = &FDInfo{
         fd:          fd
         last_active: C.time(unsafe { nil })
         is_active:   true
@@ -161,77 +175,89 @@ fn track_open(fd int) {
 
 @[export: 'track_read']
 fn track_read(fd int) {
-    if !initialized {
+    if !initialized || fd < 0 {
         return
     }
-    fd_mtx.lock()
-    defer {
-        fd_mtx.unlock()
-    }
-    if fd in fd_table {
-        mut info := fd_table[fd] or { return }
-        if info.is_active {
-            info.last_active = C.time(unsafe { nil })
+    bucket_idx := fd % bucket_count
+    mut bucket := &fd_buckets[bucket_idx]
+    if bucket.mtx.try_lock() {
+        if fd in bucket.fd_table {
+            mut info := bucket.fd_table[fd] or { 
+                bucket.mtx.unlock()
+                return 
+            }
+            if info.is_active {
+                info.last_active = C.time(unsafe { nil })
+            }
         }
+        bucket.mtx.unlock()
     }
 }
 
 @[export: 'track_close']
 fn track_close(fd int) {
-    if !initialized {
+    if !initialized || fd < 0 {
         return
     }
     rgc_log('track_close called for FD ${fd}')
-    fd_mtx.lock()
+    bucket_idx := fd % bucket_count
+    mut bucket := &fd_buckets[bucket_idx]
+    bucket.mtx.lock()
     defer {
-        fd_mtx.unlock()
+        bucket.mtx.unlock()
     }
-    if fd in fd_table {
-        mut info := fd_table[fd] or { return }
+    if fd in bucket.fd_table {
+        mut info := bucket.fd_table[fd] or { return }
         info.is_active = false
         info.is_exempt = false
     }
 }
 
 pub fn exempt_fd(fd int) {
-    if !initialized {
+    if !initialized || fd < 0 {
         return
     }
-    fd_mtx.lock()
+    bucket_idx := fd % bucket_count
+    mut bucket := &fd_buckets[bucket_idx]
+    bucket.mtx.lock()
     defer {
-        fd_mtx.unlock()
+        bucket.mtx.unlock()
     }
-    if fd in fd_table {
-        mut info := fd_table[fd] or { return }
+    if fd in bucket.fd_table {
+        mut info := bucket.fd_table[fd] or { return }
         info.is_exempt = true
     }
 }
 
 pub fn monitor_fd(fd int) {
-    if !initialized {
+    if !initialized || fd < 0 {
         return
     }
-    fd_mtx.lock()
+    bucket_idx := fd % bucket_count
+    mut bucket := &fd_buckets[bucket_idx]
+    bucket.mtx.lock()
     defer {
-        fd_mtx.unlock()
+        bucket.mtx.unlock()
     }
-    if fd in fd_table {
-        mut info := fd_table[fd] or { return }
+    if fd in bucket.fd_table {
+        mut info := bucket.fd_table[fd] or { return }
         info.is_exempt = false
         info.last_active = C.time(unsafe { nil })
     }
 }
 
 pub fn set_fd_timeout(fd int, timeout_sec i64) {
-    if !initialized {
+    if !initialized || fd < 0 {
         return
     }
-    fd_mtx.lock()
+    bucket_idx := fd % bucket_count
+    mut bucket := &fd_buckets[bucket_idx]
+    bucket.mtx.lock()
     defer {
-        fd_mtx.unlock()
+        bucket.mtx.unlock()
     }
-    if fd in fd_table {
-        mut info := fd_table[fd] or { return }
+    if fd in bucket.fd_table {
+        mut info := bucket.fd_table[fd] or { return }
         info.timeout = timeout_sec
     }
 }
@@ -338,15 +364,19 @@ pub fn get_metrics() RGCMetrics {
         return RGCMetrics{}
     }
     
-    fd_mtx.lock()
     mut active_fd_count := 0
-    for _, info in fd_table {
-        if info.is_active {
-            active_fd_count++
+    mut closed_fds := u64(0)
+    for i in 0 .. bucket_count {
+        mut bucket := &fd_buckets[i]
+        bucket.mtx.lock()
+        for _, info in bucket.fd_table {
+            if info.is_active {
+                active_fd_count++
+            }
         }
+        closed_fds += total_closed_fds
+        bucket.mtx.unlock()
     }
-    closed_fds := total_closed_fds
-    fd_mtx.unlock()
 
     mtx.lock()
     mut active_custom_count := 0
@@ -368,14 +398,21 @@ pub fn get_metrics() RGCMetrics {
 
 pub fn start(config GCConfig) {
     mtx.init()
-    fd_mtx.init()
     global_config = config
     custom_resources = map[string]&CustomResource{}
-    fd_table = map[int]&FDInfo{}
     
-    fd_table[0] = &FDInfo{fd: 0, is_active: true, is_exempt: true}
-    fd_table[1] = &FDInfo{fd: 1, is_active: true, is_exempt: true}
-    fd_table[2] = &FDInfo{fd: 2, is_active: true, is_exempt: true}
+    fd_buckets = []FDBucket{len: bucket_count}
+    for i in 0 .. bucket_count {
+        fd_buckets[i].mtx.init()
+        fd_buckets[i].fd_table = map[int]&FDInfo{}
+    }
+    
+    track_open(0)
+    track_open(1)
+    track_open(2)
+    exempt_fd(0)
+    exempt_fd(1)
+    exempt_fd(2)
 
     initialized = true
     spawn gc_worker(config)
