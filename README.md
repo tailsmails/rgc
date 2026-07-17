@@ -153,6 +153,8 @@ A common pitfall in concurrent programming is executing arbitrary user code whil
 - In the first phase, it locks the resource table, identifies all expired custom resources, removes them from the active list, and temporarily buffers them.
 - In the second phase, it completely releases the global mutex *before* iterating over the expired buffer to execute the user's custom cleanup callbacks. This design guarantees thread-safety and eliminates the possibility of deadlocks.
 
+---
+
 ### Timeout Management
 
 RGC allows you to maintain control over the lifetimes of your sockets, files, and custom resources. By default, resources are garbage-collected based on a global idle timeout, but you can also configure fine-grained, individual timeouts for specific file descriptors or custom resources.
